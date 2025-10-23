@@ -9,24 +9,16 @@ _CACHED_SESSION_TS = 0.0
 _SESSION_TTL_SECONDS = int(os.environ.get("ZNUNY_SESSION_TTL", "3300"))  # ~55 min por defecto
 
 
-def _znuny_api_base() -> str:
-    """Devuelve la base URL de la API REST de Znuny/OTRS."""
-    return os.environ.get(
-        "ZNUNY_BASE_API",
-        "http://localhost:8080/otrs/nph-genericinterface.pl/Webservice/GenericTicketConnectorREST"
-    ).rstrip("/")
-
-
 def _login_create_session() -> str:
     """Crea un nuevo SessionID autenticando contra Znuny."""
-    user = os.environ.get("ZNUNY_USER", "root@localhost")
-    password = os.environ.get("ZNUNY_PASS", "NVhPcVbpyytIDMeS")
+    user = os.environ.get("ZNUNY_USERNAME")
+    password = os.environ.get("ZNUNY_PASSWORD")
+    base_url = os.environ.get("ZNUNY_BASE_API")
 
-    if not user or not password:
-        raise RuntimeError("Faltan ZNUNY_USER y/o ZNUNY_PASS en variables de entorno")
+    if not all([user, password, base_url]):
+        raise RuntimeError("Faltan variables de entorno requeridas: ZNUNY_USERNAME, ZNUNY_PASSWORD o ZNUNY_BASE_API")
 
-    url = f"{_znuny_api_base()}/Session"
-    # Use the local `password` variable as the credential sent to Znuny
+    url = f"{base_url.rstrip('/')}/Session"
     payload = {"UserLogin": user, "Password": password}
     headers = {
         "Content-Type": "application/json; charset=UTF-8",
@@ -35,9 +27,6 @@ def _login_create_session() -> str:
         "User-Agent": "curl/7.81.0",
     }
 
-    print(f"[Znuny] Intentando autenticación PATCH en {url}")
-    print(f"[Znuny] Payload: {json.dumps(payload)}")
-
     try:
         resp = requests.patch(
             url,
@@ -45,26 +34,22 @@ def _login_create_session() -> str:
             headers=headers,
             timeout=10
         )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        session_id = (
+            data.get("SessionID")
+            or data.get("Session")
+            or data.get("session_id")
+        )
+
+        if not session_id:
+            raise RuntimeError(f"Znuny no devolvió SessionID. Respuesta: {data}")
+
+        return session_id
+        
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Error de conexión al autenticar: {e}")
-
-    print(f"[Znuny] Status: {resp.status_code}")
-    print(f"[Znuny] Respuesta: {resp.text}")
-
-    resp.raise_for_status()
-    data = resp.json()
-
-    session_id = (
-        data.get("SessionID")
-        or data.get("Session")
-        or data.get("session_id")
-    )
-
-    if not session_id:
-        raise RuntimeError(f"Znuny no devolvió SessionID. Respuesta: {data}")
-
-    print(f"[Znuny] ✅ Login exitoso. SessionID: {session_id[:10]}...")
-    return session_id
 
 
 def get_or_create_session_id() -> str:
@@ -99,7 +84,7 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
             or last.get("Text") or last.get("text")
         )
 
-    base = _znuny_api_base()
+    base = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
     headers = {"Accept": "application/json"}
 
     # Intentar con Ticket/{id}?AllArticles=1
@@ -141,7 +126,8 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
 
 def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority_id, state_id, subject, body, dynamic_fields=None):
     """Actualiza un ticket en Znuny agregando un nuevo artículo."""
-    url = f"{_znuny_api_base()}/Ticket/{ticket_id}"
+    base_url = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
+    url = f"{base_url}/Ticket/{ticket_id}"
     payload = {
         "SessionID": session_id,
         "TicketID": ticket_id,
