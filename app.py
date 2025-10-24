@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 
-# Cargar variables de entorno desde .env
-load_dotenv()
+# Cargar variables de entorno desde env_vars/.env
+load_dotenv("env_vars/.env")
 
 from flask import Flask
 from controllers.agent_controller import agent_bp

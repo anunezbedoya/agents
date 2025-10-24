@@ -37,11 +37,7 @@ def _login_create_session() -> str:
         resp.raise_for_status()
         data = resp.json()
         
-        session_id = (
-            data.get("SessionID")
-            or data.get("Session")
-            or data.get("session_id")
-        )
+        session_id = data.get("SessionID")
 
         if not session_id:
             raise RuntimeError(f"Znuny no devolvió SessionID. Respuesta: {data}")
@@ -78,11 +74,7 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
             articles,
             key=lambda a: a.get("CreateTime") or a.get("ArticleID") or 0
         )[-1]
-        return (
-            last.get("Body") or last.get("body")
-            or last.get("Content") or last.get("content")
-            or last.get("Text") or last.get("text")
-        )
+        return last.get("Body")
 
     base = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
     headers = {"Accept": "application/json"}
@@ -96,28 +88,10 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
             ticket_data = data.get("Ticket")
             if isinstance(ticket_data, list):
                 ticket_data = ticket_data[0]
-            articles = (
-                ticket_data.get("Article") or ticket_data.get("Articles")
-                or ticket_data.get("article") or ticket_data.get("articles")
-                if ticket_data else None
-            )
+            articles = ticket_data.get("Article") if ticket_data else None
             body = _extract_body(articles)
             if body:
                 return body
-    except Exception:
-        pass
-
-    # Fallback con Article?TicketID=...
-    try:
-        url_article = f"{base}/Article?TicketID={ticket_id}&SessionID={session_id}"
-        r2 = requests.get(url_article, headers=headers, timeout=10)
-        if r2.status_code == 200:
-            data2 = r2.json()
-            articles2 = (
-                data2.get("Article") or data2.get("Articles")
-                or data2.get("article") or data2.get("articles")
-            )
-            return _extract_body(articles2)
     except Exception:
         pass
 
