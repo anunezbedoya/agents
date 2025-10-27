@@ -2,24 +2,22 @@ from flask import Blueprint, request, jsonify
 import datetime
 import json
 import os
-from services.agent_service import AgentService
-from services.update_service import get_or_create_session_id
+# Importa solo lo necesario para el controlador
+from services.update_service import (
+    update_ticket_with_auto_diagnosis, 
+    get_or_create_session_id,
+)
 
 agent_bp = Blueprint("agent", __name__)
-service = AgentService()
 
 
-
-
+# --------------------------------------------------------------------------
+## Endpoint: Actualización Manual (/agent/update)
+# --------------------------------------------------------------------------
 @agent_bp.route("/agent/update", methods=["POST"])
 def update_with_diagnosis():
-    """Actualiza un ticket en Znuny generando diagnóstico automáticamente."""
-    from services.update_service import (
-        get_or_create_session_id,
-        get_ticket_latest_article,
-        actualizar_ticket,
-    )
-
+    """Endpoint HTTP que delega la actualización y el diagnóstico al servicio."""
+    
     data = request.get_json() or {}
     ticket_id = data.get("ticket_id")
 
@@ -27,56 +25,31 @@ def update_with_diagnosis():
         return jsonify({"error": "Debe enviar 'ticket_id'"}), 400
 
     try:
-        # Obtener SessionID
-        session_id = data.get("session_id") or get_or_create_session_id()
-        
-        # Parámetros con valores por defecto
-        titulo = data.get("titulo") or f"Actualización ticket {ticket_id}"
-        usuario = data.get("usuario") or ""
-        queue_id = data.get("queue_id") or 1
-        priority_id = data.get("priority_id") or 3
-        state_id = data.get("state_id") or 4
-        subject = data.get("subject") or "Actualización desde API"
-        body = data.get("body")
-        ticket_text = data.get("ticket_text")
-
-        # Obtener texto del ticket si no se pasó body ni ticket_text
-        if not body and not ticket_text:
-            ticket_text = get_ticket_latest_article(ticket_id, session_id)
-
-        if not ticket_text and not body:
-            return jsonify({"error": "No se encontró texto del ticket ni se envió 'body'."}), 400
-
-        # Generar diagnóstico si no se pasó body explícito
-        if not body:
-            body = service.diagnose_ticket(ticket_text)
-
-        # Actualizar ticket con el diagnóstico
-        resp = actualizar_ticket(
-            ticket_id=ticket_id,
-            session_id=session_id,
-            titulo=titulo,
-            usuario=usuario,
-            queue_id=queue_id,
-            priority_id=priority_id,
-            state_id=state_id,
-            subject=subject,
-            body=body,
+        # LLAMADA DIRECTA A LA LÓGICA CENTRAL
+        result = update_ticket_with_auto_diagnosis(
+            ticket_id=ticket_id, 
+            session_id=data.get("session_id"), 
+            data=data
         )
+        return jsonify(result), 200
         
-        return jsonify({
-            "ok": True,
-            "ticket_id": ticket_id,
-            "diagnosis": body,
-            "update_response": resp
-        })
+    except ValueError as e:
+        print(f"[ERROR] Validación de datos fallida: {e}")
+        return jsonify({"error": f"Error de datos: {e}"}), 400
+    except RuntimeError as e:
+        print(f"[ERROR] Fallo en la comunicación con Znuny: {e}")
+        return jsonify({"error": f"Error de servicio Znuny: {e}"}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR] Error interno inesperado: {e}")
+        return jsonify({"error": f"Error interno inesperado: {e}"}), 500
 
 
+# --------------------------------------------------------------------------
+## Endpoint: Webhook de Znuny (/znuny-webhook)
+# --------------------------------------------------------------------------
 @agent_bp.route("/znuny-webhook", methods=["POST", "GET", "PUT"])
 def znuny_webhook():
-    """Recibe webhooks desde Znuny y encadena actualización automática."""
+    """Recibe webhooks desde Znuny y encadena actualización automática (delegando)."""
     payload = {
         "time": datetime.datetime.utcnow().isoformat() + "Z",
         "method": request.method,
@@ -99,17 +72,18 @@ def znuny_webhook():
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
-    # Intentar obtener TicketID
+    # Lógica para obtener TicketID 
     ticket_id = None
     payload_json = payload.get("json") or {}
     if isinstance(payload_json, dict):
+        # Forma concisa y robusta de buscar TicketID en las ubicaciones más probables
         ticket_id = (
-            payload_json.get("TicketID")
-            or payload_json.get("ticket_id")
+            (payload_json.get("Event") or {}).get("TicketID")
             or (payload_json.get("Ticket") or {}).get("TicketID")
+            or payload_json.get("TicketID")
         )
 
-    # Si no hay TicketID, intentar del último log
+    # Lógica de fallback para TicketID (Se mantiene el chequeo de logs si no se encuentra en el payload)
     if not ticket_id:
         try:
             with open(log_file, "r", encoding="utf-8") as f:
@@ -119,78 +93,50 @@ def znuny_webhook():
                     obj = json.loads(raw)
                     pj = obj.get("json") or {}
                     ticket_id = (
-                        pj.get("TicketID")
-                        or pj.get("ticket_id")
+                        (pj.get("Event") or {}).get("TicketID")
                         or (pj.get("Ticket") or {}).get("TicketID")
+                        or pj.get("TicketID")
                     )
-                    if ticket_id:
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
+                    if ticket_id: break
+                except Exception: continue
+        except Exception: pass
 
     if not ticket_id:
         return jsonify({"error": "No se encontró TicketID en el payload"}), 400
 
-    # Obtener o crear SessionID
+    # -----------------------------------------------------------
+    # CORRECCIÓN DE UNBOUNDLOCALERROR: Obtener SessionID de forma explícita
+    # -----------------------------------------------------------
     session_id = (
         os.environ.get("ZNUNY_SESSION_ID")
         or os.environ.get("SESSION_ID")
         or payload_json.get("SessionID")
-        or get_or_create_session_id()
     )
+    
+    # Si session_id sigue siendo None, forzamos la creación/obtención (llamando a la función)
+    if not session_id:
+        try:
+            session_id = get_or_create_session_id()
+            print(f"[Webhook] ✅ SessionID creado/obtenido automáticamente.")
+        except Exception as e:
+            # Si falla la creación de la sesión (ej. error de autenticación), abortamos.
+            return jsonify({"error": f"No se pudo obtener SessionID: {e}"}), 500
 
-    # Procesar ticket con diagnóstico usando servicios directamente
+
+    # Encadenar actualización: LLAMADA DIRECTA AL SERVICIO
     try:
-        from services.update_service import (
-            get_or_create_session_id,
-            get_ticket_latest_article,
-            actualizar_ticket,
-        )
-        
-        print(f"[Webhook] Procesando ticket {ticket_id} con diagnóstico...")
-        
-        # Obtener SessionID
-        session_id = session_id or get_or_create_session_id()
-        
-        # Obtener contenido del ticket
-        ticket_text = get_ticket_latest_article(ticket_id, session_id)
-        
-        if not ticket_text:
-            return jsonify({
-                "status": "error", 
-                "ticket_id": ticket_id,
-                "error": "No se encontró contenido del ticket"
-            }), 400
-        
-        # Generar diagnóstico
-        diagnosis = service.diagnose_ticket(ticket_text)
-        
-        # Actualizar ticket
-        resp = actualizar_ticket(
+        print(f"[Webhook] Procesando ticket {ticket_id}...")
+   
+        update_ticket_with_auto_diagnosis(
             ticket_id=ticket_id,
             session_id=session_id,
-            titulo=f"Actualización ticket {ticket_id}",
-            usuario="",
-            queue_id=1,
-            priority_id=3,
-            state_id=4,
-            subject="Actualización desde API",
-            body=diagnosis,
+            data=payload_json
         )
+        print(f"[Webhook] Actualización de ticket {ticket_id} completada.")
         
-        print(f"[Webhook] ✅ Ticket {ticket_id} procesado exitosamente")
-        return jsonify({
-            "status": "ok", 
-            "ticket_id": ticket_id,
-            "diagnosis": diagnosis,
-            "update_response": resp
-        }), 200
     except Exception as e:
-        print(f"[Webhook] ❌ Error procesando ticket {ticket_id}: {e}")
-        return jsonify({
-            "status": "error", 
-            "ticket_id": ticket_id,
-            "error": str(e)
-        }), 500
+        # Maneja cualquier fallo en la lógica central y lo registra.
+        print(f"[Webhook] Error al procesar el webhook: {e}")
+        return jsonify({"status": "error", "message": f"Fallo en la actualización: {e}"}), 500 
+
+    return jsonify({"status": "ok", "ticket_id": ticket_id}), 200

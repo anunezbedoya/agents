@@ -2,13 +2,22 @@ import os
 import time
 import json
 import requests
+# Asumo que AgentService está en un módulo llamado .agent_service
+from .agent_service import AgentService 
 
-# Cache de sesión
+
+# --------------------------------------------------------------------------
+# CONFIGURACIÓN Y CACHÉ DE SESIÓN
+# --------------------------------------------------------------------------
+_AGENT_SERVICE = AgentService() # Instancia del servicio de diagnóstico
 _CACHED_SESSION_ID = None
 _CACHED_SESSION_TS = 0.0
-_SESSION_TTL_SECONDS = int(os.environ.get("ZNUNY_SESSION_TTL", "3300"))  # ~55 min por defecto
+_SESSION_TTL_SECONDS = int(os.environ.get("ZNUNY_SESSION_TTL", "3300"))
 
 
+# --------------------------------------------------------------------------
+# AUTENTICACIÓN Y SESIÓN
+# --------------------------------------------------------------------------
 def _login_create_session() -> str:
     """Crea un nuevo SessionID autenticando contra Znuny."""
     user = os.environ.get("ZNUNY_USERNAME")
@@ -65,11 +74,15 @@ def get_or_create_session_id() -> str:
     return _CACHED_SESSION_ID
 
 
+# --------------------------------------------------------------------------
+# OBTENCIÓN DE DATOS
+# --------------------------------------------------------------------------
 def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
     """Obtiene el texto del último artículo de un ticket en Znuny."""
     def _extract_body(articles):
         if not isinstance(articles, list) or not articles:
             return None
+        # Ordena por CreateTime o ArticleID (como fallback) y toma el último
         last = sorted(
             articles,
             key=lambda a: a.get("CreateTime") or a.get("ArticleID") or 0
@@ -83,21 +96,27 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
     try:
         url_ticket = f"{base}/Ticket/{ticket_id}?SessionID={session_id}&AllArticles=1"
         r = requests.get(url_ticket, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            ticket_data = data.get("Ticket")
-            if isinstance(ticket_data, list):
-                ticket_data = ticket_data[0]
-            articles = ticket_data.get("Article") if ticket_data else None
-            body = _extract_body(articles)
-            if body:
-                return body
-    except Exception:
-        pass
+        r.raise_for_status() # Lanza excepción si hay un error HTTP (4xx o 5xx)
+        data = r.json()
+        ticket_data = data.get("Ticket")
+        if isinstance(ticket_data, list):
+            ticket_data = ticket_data[0]
+        articles = ticket_data.get("Article") if ticket_data else None
+        
+        return _extract_body(articles)
 
-    return None
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Fallo al obtener el artículo del ticket {ticket_id}: {e}")
+        # En este caso, simplemente retornamos None si falla la obtención del texto.
+        return None
+    except Exception as e:
+        print(f"[ERROR] Error inesperado al procesar artículos de Znuny: {e}")
+        return None
 
 
+# --------------------------------------------------------------------------
+# ACTUALIZACIÓN DE TICKET
+# --------------------------------------------------------------------------
 def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority_id, state_id, subject, body, dynamic_fields=None):
     """Actualiza un ticket en Znuny agregando un nuevo artículo."""
     base_url = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
@@ -132,4 +151,90 @@ def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority
         r.raise_for_status()
         return r.json()
     except requests.exceptions.RequestException as e:
+        # Devuelve un dict de error que la función orquestadora manejará
         return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# FUNCIÓN DE ORQUESTACIÓN (LA LÓGICA CENTRAL)
+# --------------------------------------------------------------------------
+
+def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, data: dict = None):
+    """
+    Orquesta la obtención de datos, generación de diagnóstico y actualización del ticket.
+    Es la lógica central usada por todos los endpoints.
+    """
+    data = data or {}
+
+    # Importación e inicialización local para evitar referencias circulares
+    # Esto reemplaza a la variable global _AGENT_SERVICE
+    try:
+        from .agent_service import AgentService 
+        _agent_service = AgentService()
+    except ImportError as e:
+        # Esto captura el error si AgentService no se encuentra, lo que es un error de configuración crítico.
+        raise RuntimeError(f"Fallo al cargar AgentService: {e}")
+
+    # 1. Obtener SessionID si no se ha pasado (usa la caché y la creación si es necesario)
+    if not session_id:
+        # Esto lanzará RuntimeError si falla la autenticación
+        # get_or_create_session_id debe ser importada al inicio del archivo update_service.py
+        session_id = get_or_create_session_id()
+        print(f"[Service] ✅ Obtenido SessionID para la operación.")
+
+    # 2. Parámetros opcionales y valores por defecto
+    titulo = data.get("titulo") or f"Actualización ticket {ticket_id}"
+    usuario = data.get("usuario") or ""
+    queue_id = data.get("queue_id") or 1
+    priority_id = data.get("priority_id") or 3
+    state_id = data.get("state_id") or 4
+    subject = data.get("subject") or "Actualización desde API"
+    body = data.get("body")
+    ticket_text = data.get("ticket_text")
+
+    # 3. Obtener texto del ticket si no se pasó (y es necesario para el diagnóstico)
+    if not body and not ticket_text:
+        print(f"[Service] Buscando último artículo del ticket {ticket_id}...")
+        # get_ticket_latest_article debe ser importada/definida en este archivo
+        ticket_text = get_ticket_latest_article(ticket_id, session_id)
+
+    if not ticket_text and not body:
+        # Esto será capturado por el controlador como un 400 (ValueError)
+        raise ValueError("No se encontró texto del ticket ni se envió 'body' para el diagnóstico.")
+
+    # 4. Generar diagnóstico si no se pasó body explícito
+    if not body:
+        try:
+            print("[Service] Generando diagnóstico a partir del ticket...")
+            # Llama a la instancia local del AgentService
+            body = _agent_service.diagnose_ticket(ticket_text)
+        except Exception as e:
+            # Captura fallos de la API de diagnóstico
+            raise RuntimeError(f"Fallo al generar el diagnóstico: {e}")
+
+    # 5. Actualizar ticket
+    print(f"[Service] Enviando actualización a ticket {ticket_id}...")
+    # actualizar_ticket debe ser importada/definida en este archivo
+    resp = actualizar_ticket(
+        ticket_id=ticket_id,
+        session_id=session_id,
+        titulo=titulo,
+        usuario=usuario,
+        queue_id=queue_id,
+        priority_id=priority_id,
+        state_id=state_id,
+        subject=subject,
+        body=body,
+    )
+    
+    # 6. Manejar errores de actualización de Znuny
+    if isinstance(resp, dict) and 'error' in resp:
+        # Esto será capturado por el controlador como un 500 (RuntimeError)
+        raise RuntimeError(f"Fallo al actualizar Znuny: {resp['error']}")
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "diagnosis": body,
+        "update_response": resp
+    }
