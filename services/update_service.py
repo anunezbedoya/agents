@@ -2,18 +2,22 @@ import os
 import time
 import json
 import requests
-# Asumo que AgentService está en un módulo llamado .agent_service
 from .agent_service import AgentService 
 
+try:
+    _AGENT_SERVICE = AgentService() 
+except ImportError as e:
+    # Esto asegura que si el archivo AgentService falta, la aplicación falle 
+    # inmediatamente al iniciar, no durante un webhook.
+    raise RuntimeError(f"Fallo al cargar AgentService: {e}")
 
 # --------------------------------------------------------------------------
 # CONFIGURACIÓN Y CACHÉ DE SESIÓN
 # --------------------------------------------------------------------------
-_AGENT_SERVICE = AgentService() # Instancia del servicio de diagnóstico
+
 _CACHED_SESSION_ID = None
 _CACHED_SESSION_TS = 0.0
 _SESSION_TTL_SECONDS = int(os.environ.get("ZNUNY_SESSION_TTL", "3300"))
-
 
 # --------------------------------------------------------------------------
 # AUTENTICACIÓN Y SESIÓN
@@ -78,16 +82,49 @@ def get_or_create_session_id() -> str:
 # OBTENCIÓN DE DATOS
 # --------------------------------------------------------------------------
 def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
-    """Obtiene el texto del último artículo de un ticket en Znuny."""
-    def _extract_body(articles):
+    """
+    Obtiene el texto del artículo más relevante (asumiendo que el último es una notificación)
+    de un ticket en Znuny, combinando Asunto y Cuerpo para la IA.
+    """
+       
+    def _extract_relevant_text(articles):
         if not isinstance(articles, list) or not articles:
             return None
-        # Ordena por CreateTime o ArticleID (como fallback) y toma el último
-        last = sorted(
-            articles,
+
+        # Ya no se realiza ningún filtrado. Se usan todos los artículos.
+        relevant_articles = articles 
+
+        # 1. ORDENAR LOS ARTÍCULOS:
+        # Ordenamos los artículos por fecha/ID
+        sorted_articles = sorted(
+            relevant_articles,
             key=lambda a: a.get("CreateTime") or a.get("ArticleID") or 0
-        )[-1]
-        return last.get("Body")
+        )
+        
+        # 2. SELECCIONAR EL ARTÍCULO RELEVANTE (Lógica de -2 con red de seguridad):
+        
+        # Debe haber al menos un artículo para continuar
+        if not sorted_articles:
+            return None
+            
+        # Si la lista tiene 2 o más artículos, asumimos que el último es la notificación 
+        # y tomamos el penúltimo (-2).
+        if len(sorted_articles) >= 2:
+            last_relevant = sorted_articles[-2] 
+        else:
+            # Si solo tiene 1 artículo (o 0, aunque ya se filtró), tomamos el único artículo (-1).
+            last_relevant = sorted_articles[-1]
+        
+        # 3. COMBINAR: Combina el Asunto y el Cuerpo.
+        subject = last_relevant.get("Subject", "")
+        body = last_relevant.get("Body", "")
+        
+        if not subject and not body:
+            return None
+        
+        # Retorna el texto combinado
+        return f"Asunto: {subject}\n---\nQueja/Cuerpo del artículo:\n{body}"
+
 
     base = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
     headers = {"Accept": "application/json"}
@@ -96,23 +133,23 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
     try:
         url_ticket = f"{base}/Ticket/{ticket_id}?SessionID={session_id}&AllArticles=1"
         r = requests.get(url_ticket, headers=headers, timeout=10)
-        r.raise_for_status() # Lanza excepción si hay un error HTTP (4xx o 5xx)
+        r.raise_for_status() 
         data = r.json()
+        
         ticket_data = data.get("Ticket")
         if isinstance(ticket_data, list):
             ticket_data = ticket_data[0]
+            
         articles = ticket_data.get("Article") if ticket_data else None
         
-        return _extract_body(articles)
+        return _extract_relevant_text(articles) 
 
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] Fallo al obtener el artículo del ticket {ticket_id}: {e}")
-        # En este caso, simplemente retornamos None si falla la obtención del texto.
         return None
     except Exception as e:
         print(f"[ERROR] Error inesperado al procesar artículos de Znuny: {e}")
         return None
-
 
 # --------------------------------------------------------------------------
 # ACTUALIZACIÓN DE TICKET
@@ -140,6 +177,10 @@ def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority
 
     if dynamic_fields:
         payload["Ticket"]["DynamicFields"] = dynamic_fields
+    
+    print("\n--- DEBUG: PAYLOAD DE ACTUALIZACIÓN ENVIADO A ZNUNY ---")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print("----------------------------------------------------------\n")
 
     try:
         r = requests.patch(
@@ -162,59 +203,58 @@ def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority
 def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, data: dict = None):
     """
     Orquesta la obtención de datos, generación de diagnóstico y actualización del ticket.
-    Es la lógica central usada por todos los endpoints.
+    Siempre obtiene el último artículo del ticket desde Znuny para generar un diagnóstico.
     """
     data = data or {}
+    diagnosis_body = None  
 
-    # Importación e inicialización local para evitar referencias circulares
-    # Esto reemplaza a la variable global _AGENT_SERVICE
-    try:
-        from .agent_service import AgentService 
-        _agent_service = AgentService()
-    except ImportError as e:
-        # Esto captura el error si AgentService no se encuentra, lo que es un error de configuración crítico.
-        raise RuntimeError(f"Fallo al cargar AgentService: {e}")
-
-    # 1. Obtener SessionID si no se ha pasado (usa la caché y la creación si es necesario)
+    # 1. Preparación del Agente (Referencia al agente global)
+    global _AGENT_SERVICE 
+    
+    # 2. Obtener SessionID
     if not session_id:
-        # Esto lanzará RuntimeError si falla la autenticación
-        # get_or_create_session_id debe ser importada al inicio del archivo update_service.py
         session_id = get_or_create_session_id()
         print(f"[Service] ✅ Obtenido SessionID para la operación.")
 
-    # 2. Parámetros opcionales y valores por defecto
+    # 3. Inicialización de Parámetros
     titulo = data.get("titulo") or f"Actualización ticket {ticket_id}"
     usuario = data.get("usuario") or ""
     queue_id = data.get("queue_id") or 1
     priority_id = data.get("priority_id") or 3
     state_id = data.get("state_id") or 4
-    subject = data.get("subject") or "Actualización desde API"
-    body = data.get("body")
-    ticket_text = data.get("ticket_text")
+    subject = data.get("subject") or "Diagnóstico Automático (IA)"
 
-    # 3. Obtener texto del ticket si no se pasó (y es necesario para el diagnóstico)
-    if not body and not ticket_text:
-        print(f"[Service] Buscando último artículo del ticket {ticket_id}...")
-        # get_ticket_latest_article debe ser importada/definida en este archivo
-        ticket_text = get_ticket_latest_article(ticket_id, session_id)
+    # 4. Obtener Texto de Origen y Generar Diagnóstico (Siempre se ejecuta)
+    
+    # A. Obtener texto del ticket (SOLO desde Znuny)
+    
+    # Inicialización limpia antes de buscar
+    ticket_text = None 
+    
+    print(f"[Service] Buscando último artículo del ticket {ticket_id}...")
+    # Llamada obligatoria a la API de Znuny para obtener el texto de origen
+    ticket_text = get_ticket_latest_article(ticket_id, session_id)
 
-    if not ticket_text and not body:
-        # Esto será capturado por el controlador como un 400 (ValueError)
-        raise ValueError("No se encontró texto del ticket ni se envió 'body' para el diagnóstico.")
-
-    # 4. Generar diagnóstico si no se pasó body explícito
-    if not body:
-        try:
-            print("[Service] Generando diagnóstico a partir del ticket...")
-            # Llama a la instancia local del AgentService
-            body = _agent_service.diagnose_ticket(ticket_text)
-        except Exception as e:
-            # Captura fallos de la API de diagnóstico
-            raise RuntimeError(f"Fallo al generar el diagnóstico: {e}")
-
+    if not ticket_text:
+        # ERROR CRÍTICO si la API de Znuny no devuelve contenido.
+        raise ValueError("No se encontró texto del ticket (último artículo) para generar el diagnóstico.")
+        
+    # B. Generar Diagnóstico con IA
+    try:
+        print("[Service] Generando diagnóstico a partir del ticket...")
+        
+        # USO DEL SERVICIO GLOBAL:
+        diagnosis_body = _AGENT_SERVICE.diagnose_ticket(ticket_text)
+        
+        # Validación obligatoria:
+        if not diagnosis_body or diagnosis_body.strip() == "":
+             raise RuntimeError("El modelo de IA devolvió un diagnóstico vacío.")
+             
+    except Exception as e:
+        raise RuntimeError(f"Fallo al generar el diagnóstico: {e}")
+            
     # 5. Actualizar ticket
     print(f"[Service] Enviando actualización a ticket {ticket_id}...")
-    # actualizar_ticket debe ser importada/definida en este archivo
     resp = actualizar_ticket(
         ticket_id=ticket_id,
         session_id=session_id,
@@ -224,17 +264,16 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
         priority_id=priority_id,
         state_id=state_id,
         subject=subject,
-        body=body,
+        body=diagnosis_body, # Usamos el diagnóstico generado.
     )
     
     # 6. Manejar errores de actualización de Znuny
     if isinstance(resp, dict) and 'error' in resp:
-        # Esto será capturado por el controlador como un 500 (RuntimeError)
         raise RuntimeError(f"Fallo al actualizar Znuny: {resp['error']}")
 
     return {
         "ok": True,
         "ticket_id": ticket_id,
-        "diagnosis": body,
+        "diagnosis": diagnosis_body,
         "update_response": resp
     }
