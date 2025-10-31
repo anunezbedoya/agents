@@ -154,8 +154,11 @@ def get_ticket_latest_article(ticket_id: int, session_id: str) -> str | None:
 # --------------------------------------------------------------------------
 # ACTUALIZACIÓN DE TICKET
 # --------------------------------------------------------------------------
-def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority_id, state_id, subject, body, dynamic_fields=None):
-    """Actualiza un ticket en Znuny agregando un nuevo artículo."""
+# Añadido: 'type_id=None' al def
+def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority_id,
+                       state_id, subject, body, dynamic_fields=None, type_id=None):
+    """Actualiza un ticket en Znuny agregando un nuevo artículo y metadata."""
+
     base_url = os.environ.get("ZNUNY_BASE_API", "").rstrip("/")
     url = f"{base_url}/Ticket/{ticket_id}"
     payload = {
@@ -175,8 +178,13 @@ def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority
         }
     }
 
+    # Lógica para agregar campos opcionales
     if dynamic_fields:
         payload["Ticket"]["DynamicFields"] = dynamic_fields
+        
+    # Lógica CLAVE: Agregar TypeID al payload de Znuny
+    if type_id is not None:
+        payload["Ticket"]["TypeID"] = type_id
     
     print("\n--- DEBUG: PAYLOAD DE ACTUALIZACIÓN ENVIADO A ZNUNY ---")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -202,12 +210,14 @@ def actualizar_ticket(ticket_id, session_id, titulo, usuario, queue_id, priority
 
 def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, data: dict = None):
     """
-    Orquesta la obtención de datos, generación de diagnóstico y actualización del ticket.
-    Siempre obtiene el último artículo del ticket desde Znuny para generar un diagnóstico.
+    Orquesta la obtención de datos, generación de diagnóstico de IA y actualización del ticket
+    en Znuny, clasificando el campo Tipo con el TypeID numérico obtenido.
     """
     data = data or {}
+    # Inicialización de variables de diagnóstico y clasificación
     diagnosis_body = None  
-
+    type_id_from_ia = None
+    
     # 1. Preparación del Agente (Referencia al agente global)
     global _AGENT_SERVICE 
     
@@ -216,7 +226,7 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
         session_id = get_or_create_session_id()
         print(f"[Service] ✅ Obtenido SessionID para la operación.")
 
-    # 3. Inicialización de Parámetros
+    # 3. Inicialización de Parámetros por defecto o desde la entrada 'data'
     titulo = data.get("titulo") or f"Actualización ticket {ticket_id}"
     usuario = data.get("usuario") or ""
     queue_id = data.get("queue_id") or 1
@@ -224,37 +234,49 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
     state_id = data.get("state_id") or 4
     subject = data.get("subject") or "Diagnóstico Automático (IA)"
 
-    # 4. Obtener Texto de Origen y Generar Diagnóstico (Siempre se ejecuta)
+    # 4. Obtener Texto de Origen y Generar Diagnóstico
     
-    # A. Obtener texto del ticket (SOLO desde Znuny)
-    
-    # Inicialización limpia antes de buscar
+    # A. Obtener texto del ticket (último artículo)
     ticket_text = None 
-    
     print(f"[Service] Buscando último artículo del ticket {ticket_id}...")
-    # Llamada obligatoria a la API de Znuny para obtener el texto de origen
     ticket_text = get_ticket_latest_article(ticket_id, session_id)
 
     if not ticket_text:
-        # ERROR CRÍTICO si la API de Znuny no devuelve contenido.
+        # Error si no hay contenido para analizar
         raise ValueError("No se encontró texto del ticket (último artículo) para generar el diagnóstico.")
         
-    # B. Generar Diagnóstico con IA
+    # B. Generar Diagnóstico con IA y Parsear la Respuesta JSON
     try:
         print("[Service] Generando diagnóstico a partir del ticket...")
         
-        # USO DEL SERVICIO GLOBAL:
-        diagnosis_body = _AGENT_SERVICE.diagnose_ticket(ticket_text)
+        # 1. Obtener la respuesta (cadena de texto JSON) del Agente de IA
+        response_text = _AGENT_SERVICE.diagnose_ticket(ticket_text)
         
-        # Validación obligatoria:
-        if not diagnosis_body or diagnosis_body.strip() == "":
+        # 2. Validación de respuesta no vacía
+        if not response_text or response_text.strip() == "":
              raise RuntimeError("El modelo de IA devolvió un diagnóstico vacío.")
+
+        # 3. Conversión de JSON (texto) a Diccionario de Python
+        diagnosis_data = json.loads(response_text) 
+        
+        # 4. Extracción de TypeID y Diagnóstico
+        type_id_from_ia = diagnosis_data.get("type_id")
+        diagnosis_body = diagnosis_data.get("diagnostico")
+        
+        # 5. Conversión a entero (si es necesario) y validación de TypeID
+        if type_id_from_ia is not None:
+            # Intenta convertir el valor del TypeID a entero para la API de Znuny
+            type_id_from_ia = int(type_id_from_ia)
              
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        # Captura errores de parseo JSON o conversión de tipos
+        raise RuntimeError(f"Fallo al procesar la respuesta JSON de la IA: {e}")
     except Exception as e:
+        # Captura cualquier otro error en el proceso de diagnóstico
         raise RuntimeError(f"Fallo al generar el diagnóstico: {e}")
             
     # 5. Actualizar ticket
-    print(f"[Service] Enviando actualización a ticket {ticket_id}...")
+    print(f"[Service] Enviando actualización a ticket {ticket_id} con TypeID: {type_id_from_ia}...")
     resp = actualizar_ticket(
         ticket_id=ticket_id,
         session_id=session_id,
@@ -263,8 +285,9 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
         queue_id=queue_id,
         priority_id=priority_id,
         state_id=state_id,
+        type_id=type_id_from_ia, # <-- Campo CLAVE: Pasa el TypeID numérico para actualizar el Tipo.
         subject=subject,
-        body=diagnosis_body, # Usamos el diagnóstico generado.
+        body=diagnosis_body,     # Pasa el texto descriptivo extraído del diagnóstico.
     )
     
     # 6. Manejar errores de actualización de Znuny
@@ -274,6 +297,7 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
     return {
         "ok": True,
         "ticket_id": ticket_id,
-        "diagnosis": diagnosis_body,
+        "type_id_applied": type_id_from_ia,
+        "diagnosis_body": diagnosis_body,
         "update_response": resp
     }
