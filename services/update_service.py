@@ -213,20 +213,18 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
     Orquesta la obtención de datos, generación de diagnóstico de IA y actualización del ticket
     en Znuny, clasificando el campo Tipo con el TypeID numérico obtenido.
     """
+    import json # Importar json si no está ya al inicio del archivo
+    
     data = data or {}
-    # Inicialización de variables de diagnóstico y clasificación
     diagnosis_body = None  
     type_id_from_ia = None
     
-    # 1. Preparación del Agente (Referencia al agente global)
     global _AGENT_SERVICE 
     
-    # 2. Obtener SessionID
     if not session_id:
         session_id = get_or_create_session_id()
         print(f"[Service] ✅ Obtenido SessionID para la operación.")
 
-    # 3. Inicialización de Parámetros por defecto o desde la entrada 'data'
     titulo = data.get("titulo") or f"Actualización ticket {ticket_id}"
     usuario = data.get("usuario") or ""
     queue_id = data.get("queue_id") or 1
@@ -234,49 +232,55 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
     state_id = data.get("state_id") or 4
     subject = data.get("subject") or "Diagnóstico Automático (IA)"
 
-    # 4. Obtener Texto de Origen y Generar Diagnóstico
-    
-    # A. Obtener texto del ticket (último artículo)
     ticket_text = None 
     print(f"[Service] Buscando último artículo del ticket {ticket_id}...")
+    # Asume que get_ticket_latest_article y get_or_create_session_id están definidos en el módulo.
     ticket_text = get_ticket_latest_article(ticket_id, session_id)
 
     if not ticket_text:
-        # Error si no hay contenido para analizar
         raise ValueError("No se encontró texto del ticket (último artículo) para generar el diagnóstico.")
         
-    # B. Generar Diagnóstico con IA y Parsear la Respuesta JSON
     try:
         print("[Service] Generando diagnóstico a partir del ticket...")
         
-        # 1. Obtener la respuesta (cadena de texto JSON) del Agente de IA
+        # 1. Obtener la respuesta (cadena de texto) del Agente de IA
         response_text = _AGENT_SERVICE.diagnose_ticket(ticket_text)
         
-        # 2. Validación de respuesta no vacía
         if not response_text or response_text.strip() == "":
              raise RuntimeError("El modelo de IA devolvió un diagnóstico vacío.")
 
-        # 3. Conversión de JSON (texto) a Diccionario de Python
-        diagnosis_data = json.loads(response_text) 
+        # --- Lógica de Extracción Robusta: Buscar el JSON por corchetes ---
         
-        # 4. Extracción de TypeID y Diagnóstico
+        response_text_clean = response_text.strip()
+        start = response_text_clean.find('{')
+        end = response_text_clean.rfind('}')
+
+        if start != -1 and end != -1 and end > start:
+             # Aísla la cadena JSON, ignorando cualquier texto de razonamiento inicial.
+             json_string = response_text_clean[start : end + 1]
+        else:
+             # Si no se encuentra el objeto JSON, lanzamos el error.
+             raise RuntimeError(f"La IA devolvió texto que no contenía JSON. Respuesta: {response_text}")
+
+        # 2. Parsear la cadena JSON aislada
+        diagnosis_data = json.loads(json_string) 
+        
+        # 3. Extracción y Conversión
         type_id_from_ia = diagnosis_data.get("type_id")
         diagnosis_body = diagnosis_data.get("diagnostico")
         
-        # 5. Conversión a entero (si es necesario) y validación de TypeID
         if type_id_from_ia is not None:
-            # Intenta convertir el valor del TypeID a entero para la API de Znuny
             type_id_from_ia = int(type_id_from_ia)
              
     except (ValueError, TypeError, json.JSONDecodeError) as e:
-        # Captura errores de parseo JSON o conversión de tipos
-        raise RuntimeError(f"Fallo al procesar la respuesta JSON de la IA: {e}")
+        # Muestra la cadena que se intentó parsear para mejor debugging
+        raise RuntimeError(f"Fallo al procesar la respuesta JSON de la IA: {e}. Cadena intentada: {json_string if 'json_string' in locals() else 'No se pudo aislar la cadena.'}")
     except Exception as e:
-        # Captura cualquier otro error en el proceso de diagnóstico
         raise RuntimeError(f"Fallo al generar el diagnóstico: {e}")
             
     # 5. Actualizar ticket
     print(f"[Service] Enviando actualización a ticket {ticket_id} con TypeID: {type_id_from_ia}...")
+    # Asume que actualizar_ticket está definida en el módulo.
     resp = actualizar_ticket(
         ticket_id=ticket_id,
         session_id=session_id,
@@ -285,12 +289,11 @@ def update_ticket_with_auto_diagnosis(ticket_id: int, session_id: str = None, da
         queue_id=queue_id,
         priority_id=priority_id,
         state_id=state_id,
-        type_id=type_id_from_ia, # <-- Campo CLAVE: Pasa el TypeID numérico para actualizar el Tipo.
+        type_id=type_id_from_ia, # Campo CLAVE
         subject=subject,
-        body=diagnosis_body,     # Pasa el texto descriptivo extraído del diagnóstico.
+        body=diagnosis_body,
     )
     
-    # 6. Manejar errores de actualización de Znuny
     if isinstance(resp, dict) and 'error' in resp:
         raise RuntimeError(f"Fallo al actualizar Znuny: {resp['error']}")
 

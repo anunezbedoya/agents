@@ -11,6 +11,9 @@ class ADKClient:
 
     def diagnose_ticket(self, ticket_text: str) -> str:
         try:
+            # ----------------------------------------------------------------------
+            # 1. CONTEXTO Y PROMPT (MODIFICADO PARA PEDIR JSON EN BLOQUE DE CÓDIGO)
+            # ----------------------------------------------------------------------
             contexto = """
 Eres un ingeniero de soporte de nivel 1 dedicado a diagnosticar y clasificar correctamente el
 ticket recibido, aplicando criterios técnicos y operativos. Tu tarea es entender la naturaleza
@@ -56,14 +59,17 @@ Si es un incidente: identifica la causa raíz probable y adjunta evidencia técn
 
 # RESPUESTA ESPERADA (SALIDA DEL MODELO)
 # IMPORTANTE: La salida que se usará para renderizar y actualizar el ticket debe contener
-# únicamente los siguientes campos en formato JSON estricto: `type_id` y `diagnostico`.
-# El valor de `type_id` DEBE SER el identificador numérico de Znuny (**10, 14, o 19**).
-# Mantén el mismo razonamiento técnico y el nivel de detalle en el proceso de análisis,
-# pero la respuesta final debe ser **UNICAMENTE** el JSON.
+# UNICAMENTE los campos `type_id` y `diagnostico` **DENTRO DE UN BLOQUE DE CÓDIGO JSON**.
+# El valor de `type_id` DEBE ser el identificador numérico de Znuny (**10, 14, o 19**).
+# LA RESPUESTA DEBE SER ESTRICTAMENTE UN BLOQUE DE CÓDIGO JSON (```json ... ```), SIN TEXTO ADICIONAL FUERA DE ÉL.
 
-# Ejemplo de salida válida (sin texto adicional):
-# 
-#   {"type_id": 10, "diagnostico": "Se ha clasificado como Incidente (10). Se requiere replicar la falla en el módulo de documentos para identificar la causa raíz."}
+# FORMATO DE RESPUESTA REQUERIDO (ESTRICTO):
+# ```json
+# {
+#   "type_id": 14, 
+#   "diagnostico": "Se ha clasificado como Petición (14). Se requiere contactar al usuario para clarificar la intención del ticket..."
+# }
+# ```
 # 
 # Si no puedes determinar uno de los campos claramente, usa una cadena vacía ("") para el valor del diagnóstico, pero el type_id siempre debe ser un número (10, 14, 19).
 
@@ -84,11 +90,14 @@ Escalamiento con contexto claro para reducir tiempos de respuesta.
 TICKET A ANALIZAR:
 {ticket_text}
 """
-
+            # ----------------------------------------------------------------------
+            # 2. LLAMADA A LA API (Mantiene response_mime_type para mayor seguridad)
+            # ----------------------------------------------------------------------
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
+                    response_mime_type="application/json", 
                     thinking_config=types.ThinkingConfig(thinking_budget=0)
                 )
             )
